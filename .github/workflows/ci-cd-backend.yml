@@ -1,0 +1,241 @@
+# .github/workflows/ci-cd-backend.yml
+
+name: Backend CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths: ["backend/**"]
+  pull_request:
+    branches: [main]
+    paths: ["backend/**"]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_USER: microservices-user-service
+  ECR_REPOSITORY_PRODUCT: microservices-product-service
+
+jobs:
+  # Job 1: Run tests and quality checks
+  test:
+    name: Test & Quality Checks
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service: [user-service, product-service]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: backend/services/${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend/services/${{ matrix.service }}
+          npm ci
+
+      - name: Run linting
+        run: |
+          cd backend/services/${{ matrix.service }}
+          npm run lint
+
+      - name: Run tests
+        run: |
+          cd backend/services/${{ matrix.service }}
+          npm test -- --coverage --watchAll=false
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: backend/services/${{ matrix.service }}/coverage/lcov.info
+          flags: ${{ matrix.service }}
+
+  # Job 2: Security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    strategy:
+      matrix:
+        service: [user-service, product-service]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run security audit
+        run: |
+          cd backend/services/${{ matrix.service }}
+          npm audit --audit-level high
+
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: backend/services/${{ matrix.service }}
+
+  # Job 3: Build and push Docker images
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main'
+
+    strategy:
+      matrix:
+        service: [user-service, product-service]
+
+    outputs:
+      user-image: ${{ steps.build-user.outputs.image }}
+      product-image: ${{ steps.build-product.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push user service image
+        if: matrix.service == 'user-service'
+        id: build-user
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd backend/services/user-service
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_USER:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_USER:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_USER:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_USER:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY_USER:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push product service image
+        if: matrix.service == 'product-service'
+        id: build-product
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd backend/services/product-service
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_PRODUCT:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_PRODUCT:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_PRODUCT:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_PRODUCT:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY_PRODUCT:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # Job 4: Deploy to staging environment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to ECS staging
+        run: |
+          # Update ECS service with new image
+          aws ecs update-service \
+            --cluster microservices-staging-cluster \
+            --service user-service-staging \
+            --force-new-deployment
+            
+          aws ecs update-service \
+            --cluster microservices-staging-cluster \
+            --service product-service-staging \
+            --force-new-deployment
+
+      - name: Wait for deployment completion
+        run: |
+          aws ecs wait services-stable \
+            --cluster microservices-staging-cluster \
+            --services user-service-staging product-service-staging
+
+      - name: Run smoke tests
+        run: |
+          # Wait for services to be healthy
+          sleep 60
+
+          # Get ALB DNS name
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names microservices-staging-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          # Test health endpoints
+          curl -f http://$ALB_DNS/user-service/health
+          curl -f http://$ALB_DNS/product-service/health
+
+  # Job 5: Deploy to production (manual approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to ECS production
+        run: |
+          # Update ECS service with new image
+          aws ecs update-service \
+            --cluster microservices-prod-cluster \
+            --service user-service-prod \
+            --force-new-deployment
+            
+          aws ecs update-service \
+            --cluster microservices-prod-cluster \
+            --service product-service-prod \
+            --force-new-deployment
+
+      - name: Wait for deployment completion
+        run: |
+          aws ecs wait services-stable \
+            --cluster microservices-prod-cluster \
+            --services user-service-prod product-service-prod
+
+      - name: Send deployment notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: "#deployments"
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()
